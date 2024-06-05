@@ -6,6 +6,9 @@ use tracing_subscriber::{fmt::Layer, layer::SubscriberExt, util::SubscriberInitE
 
 const LISTENER_ADDR: &str = "127.0.0.1:9876";
 
+#[derive(Debug, Clone)]
+struct AppState {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let layer = Layer::new().with_filter(LevelFilter::INFO);
@@ -14,7 +17,11 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(LISTENER_ADDR).await?;
     info!("Listening on: {}", LISTENER_ADDR);
 
-    let app = Router::new().route("/", get(handler));
+    let state = AppState {};
+
+    let app = Router::new()
+            .route("/", get(handler))
+            .with_state(state);
 
     axum::serve(listener, app.into_make_service()).await?;
 
