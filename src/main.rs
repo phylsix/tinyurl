@@ -8,13 +8,14 @@ use axum::{
 };
 use nanoid::nanoid;
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{prelude::FromRow, PgPool};
 use tokio::net::TcpListener;
 use tracing::{error, info, level_filters::LevelFilter};
 use tracing_subscriber::{fmt::Layer, layer::SubscriberExt, util::SubscriberInitExt, Layer as _};
 
 const LISTENER_ADDR: &str = "127.0.0.1:9876";
 const DB_ADDR: &str = "postgres://postgres:postgres@127.0.0.1:5432/tinyurl";
+const MAX_RETRIES: u8 = 3;
 
 #[derive(Debug, Deserialize)]
 struct ShortenRequest {
@@ -23,6 +24,14 @@ struct ShortenRequest {
 
 #[derive(Debug, Serialize)]
 struct ShortenResponse {
+    url: String,
+}
+
+#[derive(Debug, FromRow)]
+struct UrlRecord {
+    #[sqlx(default)]
+    id: String,
+    #[sqlx(default)]
     url: String,
 }
 
@@ -72,12 +81,25 @@ impl AppState {
     }
 
     async fn shorten(&self, url: &str) -> Result<String> {
+        let mut id = self._shorten(url).await;
+        let mut retries = 0;
+
+        // retry if the generated id already exists
+        while id.is_err() && retries < MAX_RETRIES {
+            retries += 1;
+            id = self._shorten(url).await;
+        }
+
+        id
+    }
+
+    async fn _shorten(&self, url: &str) -> Result<String> {
         let id = nanoid!(6);
 
-        sqlx::query(
+        let res: UrlRecord = sqlx::query_as(
             r#"
             INSERT INTO urls (id, url) VALUES ($1, $2)
-            ON CONFLICT (url) DO NOTHING
+            ON CONFLICT (url) DO UPDATE SET url = EXCLUDED.url
             RETURNING id
             "#,
         )
@@ -86,7 +108,7 @@ impl AppState {
         .fetch_one(&self.db)
         .await?;
 
-        Ok(id)
+        Ok(res.id)
     }
 
     async fn get_url_by_id(&self, id: &str) -> Result<Option<String>> {
