@@ -1,5 +1,11 @@
 use anyhow::Result;
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+use axum::{
+    extract::{Path, State},
+    http::{header, StatusCode},
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
 use nanoid::nanoid;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -35,7 +41,10 @@ async fn main() -> Result<()> {
 
     let state = AppState::try_new().await?;
 
-    let app = Router::new().route("/", post(shorten)).with_state(state);
+    let app = Router::new()
+        .route("/", post(shorten))
+        .route("/:id", get(redirect))
+        .with_state(state);
 
     axum::serve(listener, app.into_make_service()).await?;
 
@@ -79,6 +88,19 @@ impl AppState {
 
         Ok(id)
     }
+
+    async fn get_url_by_id(&self, id: &str) -> Result<Option<String>> {
+        let url = sqlx::query_scalar(
+            r#"
+            SELECT url FROM urls WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.db)
+        .await?;
+
+        Ok(url)
+    }
 }
 
 async fn shorten(
@@ -95,4 +117,23 @@ async fn shorten(
     });
 
     Ok((StatusCode::CREATED, body))
+}
+
+async fn redirect(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let url = state
+        .get_url_by_id(&id)
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch URL: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let mut headers = http::header::HeaderMap::new();
+    headers.insert(header::LOCATION, url.parse().unwrap());
+
+    Ok((StatusCode::PERMANENT_REDIRECT, headers))
 }
