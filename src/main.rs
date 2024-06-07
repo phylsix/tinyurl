@@ -1,14 +1,14 @@
-use anyhow::Result;
 use axum::{
     extract::{Path, State},
     http::{header, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use nanoid::nanoid;
 use serde::{Deserialize, Serialize};
 use sqlx::{prelude::FromRow, PgPool};
+use thiserror::Error;
 use tokio::net::TcpListener;
 use tracing::{error, info, level_filters::LevelFilter};
 use tracing_subscriber::{fmt::Layer, layer::SubscriberExt, util::SubscriberInitExt, Layer as _};
@@ -16,6 +16,18 @@ use tracing_subscriber::{fmt::Layer, layer::SubscriberExt, util::SubscriberInitE
 const LISTENER_ADDR: &str = "127.0.0.1:9876";
 const DB_ADDR: &str = "postgres://postgres:postgres@127.0.0.1:5432/tinyurl";
 const MAX_RETRIES: u8 = 3;
+
+#[derive(Debug, Error)]
+enum TinyUrlError {
+    #[error("Too many retries (>{0}) to generate unique URL")]
+    TooManyShortenRetries(u8),
+    #[error("ID not found: {0}")]
+    IdNotFound(String),
+    #[error("Database error: {0}")]
+    DatabaseError(#[from] sqlx::Error),
+    #[error("Network I/O error: {0}")]
+    NetIoError(#[from] std::io::Error),
+}
 
 #[derive(Debug, Deserialize)]
 struct ShortenRequest {
@@ -41,7 +53,7 @@ struct AppState {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), TinyUrlError> {
     let layer = Layer::new().with_filter(LevelFilter::INFO);
     tracing_subscriber::registry().with(layer).init();
 
@@ -61,7 +73,7 @@ async fn main() -> Result<()> {
 }
 
 impl AppState {
-    async fn try_new() -> Result<Self> {
+    async fn try_new() -> Result<Self, TinyUrlError> {
         let db = PgPool::connect(DB_ADDR).await?;
         info!("Connected to database: {}", DB_ADDR);
 
@@ -80,7 +92,7 @@ impl AppState {
         Ok(Self { db })
     }
 
-    async fn shorten(&self, url: &str) -> Result<String> {
+    async fn shorten(&self, url: &str) -> Result<String, TinyUrlError> {
         let mut id = self._shorten(url).await;
         let mut retries = 0;
 
@@ -90,10 +102,10 @@ impl AppState {
             id = self._shorten(url).await;
         }
 
-        id
+        id.map_err(|_| TinyUrlError::TooManyShortenRetries(MAX_RETRIES))
     }
 
-    async fn _shorten(&self, url: &str) -> Result<String> {
+    async fn _shorten(&self, url: &str) -> Result<String, TinyUrlError> {
         let id = nanoid!(6);
 
         let res: UrlRecord = sqlx::query_as(
@@ -111,7 +123,7 @@ impl AppState {
         Ok(res.id)
     }
 
-    async fn get_url_by_id(&self, id: &str) -> Result<Option<String>> {
+    async fn get_url_by_id(&self, id: &str) -> Result<String, TinyUrlError> {
         let url = sqlx::query_scalar(
             r#"
             SELECT url FROM urls WHERE id = $1
@@ -121,18 +133,15 @@ impl AppState {
         .fetch_optional(&self.db)
         .await?;
 
-        Ok(url)
+        url.ok_or(TinyUrlError::IdNotFound(id.to_string()))
     }
 }
 
 async fn shorten(
     State(state): State<AppState>,
     Json(data): Json<ShortenRequest>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let id = state.shorten(&data.url).await.map_err(|e| {
-        error!("Failed to shorten URL: {:?}", e);
-        StatusCode::UNPROCESSABLE_ENTITY
-    })?;
+) -> Result<impl IntoResponse, TinyUrlError> {
+    let id = state.shorten(&data.url).await?;
 
     let body = Json(ShortenResponse {
         url: format!("{}/{}", LISTENER_ADDR, id),
@@ -144,18 +153,32 @@ async fn shorten(
 async fn redirect(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let url = state
-        .get_url_by_id(&id)
-        .await
-        .map_err(|e| {
-            error!("Failed to fetch URL: {:?}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<impl IntoResponse, TinyUrlError> {
+    let url = state.get_url_by_id(&id).await?;
 
     let mut headers = http::header::HeaderMap::new();
     headers.insert(header::LOCATION, url.parse().unwrap());
 
     Ok((StatusCode::PERMANENT_REDIRECT, headers))
+}
+
+impl IntoResponse for TinyUrlError {
+    fn into_response(self) -> Response {
+        error!("{}", self);
+
+        let resp = match &self {
+            TinyUrlError::TooManyShortenRetries(_) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "URL generation failed")
+            }
+            TinyUrlError::IdNotFound(_) => (StatusCode::NOT_FOUND, "Resource Not Found"),
+            TinyUrlError::DatabaseError(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+            }
+            TinyUrlError::NetIoError(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+            }
+        };
+
+        resp.into_response()
+    }
 }
